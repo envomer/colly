@@ -1,11 +1,17 @@
 package colly
 
 import (
+	"crypto/sha1"
+	"encoding/gob"
+	"encoding/hex"
 	"errors"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
+	"path"
 	"regexp"
 	"sync"
 	"time"
@@ -16,13 +22,15 @@ import (
 type httpBackend struct {
 	LimitRules []*LimitRule
 	Client     *http.Client
-	lock       *sync.Mutex
+	lock       *sync.RWMutex
 }
 
 // LimitRule provides connection restrictions for domains.
+// Both DomainRegexp and DomainGlob can be used to specify
+// the included domains patterns, but at least one is required.
 // There can be two kind of limitations:
-//  - Parallelism: Set limit for the number of concurrent requests to a domain
-//  - Delay: Set rate limit for a domain (this means no parallelism on the matching domains)
+//  - Parallelism: Set limit for the number of concurrent requests to matching domains
+//  - Delay: Wait specified amount of time between requests (parallelism is 1 in this case)
 type LimitRule struct {
 	// DomainRegexp is a regular expression to match against domains
 	DomainRegexp string
@@ -30,6 +38,8 @@ type LimitRule struct {
 	DomainGlob string
 	// Delay is the duration to wait before creating a new request to the matching domains
 	Delay time.Duration
+	// RandomDelay is the extra randomized duration to wait added to Delay before creating a new request
+	RandomDelay time.Duration
 	// Parallelism is the number of the maximum allowed concurrent requests of the matching domains
 	Parallelism    int
 	waitChan       chan bool
@@ -68,13 +78,14 @@ func (r *LimitRule) Init() error {
 }
 
 func (h *httpBackend) Init() {
+	rand.Seed(time.Now().UnixNano())
 	h.LimitRules = make([]*LimitRule, 0, 8)
 	jar, _ := cookiejar.New(nil)
 	h.Client = &http.Client{
 		Jar:     jar,
 		Timeout: 10 * time.Second,
 	}
-	h.lock = &sync.Mutex{}
+	h.lock = &sync.RWMutex{}
 }
 
 // Match checks that the domain parameter triggers the rule
@@ -90,6 +101,8 @@ func (r *LimitRule) Match(domain string) bool {
 }
 
 func (h *httpBackend) GetMatchingRule(domain string) *LimitRule {
+	h.lock.RLock()
+	defer h.lock.RUnlock()
 	for _, r := range h.LimitRules {
 		if r.Match(domain) {
 			return r
@@ -98,12 +111,52 @@ func (h *httpBackend) GetMatchingRule(domain string) *LimitRule {
 	return nil
 }
 
+func (h *httpBackend) Cache(request *http.Request, bodySize int, cacheDir string) (*Response, error) {
+	if cacheDir == "" || request.Method != "GET" {
+		return h.Do(request, bodySize)
+	}
+	sum := sha1.Sum([]byte(request.URL.String()))
+	hash := hex.EncodeToString(sum[:])
+	dir := path.Join(cacheDir, hash[:2])
+	filename := path.Join(dir, hash)
+	if file, err := os.Open(filename); err == nil {
+		resp := new(Response)
+		err := gob.NewDecoder(file).Decode(resp)
+		file.Close()
+		if resp.StatusCode < 500 {
+			return resp, err
+		}
+	}
+	resp, err := h.Do(request, bodySize)
+	if err != nil || resp.StatusCode >= 500 {
+		return resp, err
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return resp, err
+		}
+	}
+	file, err := os.Create(filename + "~")
+	if err != nil {
+		return resp, err
+	}
+	defer file.Close()
+	if err := gob.NewEncoder(file).Encode(resp); err != nil {
+		return resp, err
+	}
+	return resp, os.Rename(filename+"~", filename)
+}
+
 func (h *httpBackend) Do(request *http.Request, bodySize int) (*Response, error) {
 	r := h.GetMatchingRule(request.URL.Host)
 	if r != nil {
 		r.waitChan <- true
 		defer func(r *LimitRule) {
-			time.Sleep(r.Delay)
+			randomDelay := time.Duration(0)
+			if r.RandomDelay != 0 {
+				randomDelay = time.Duration(rand.Intn(int(r.RandomDelay)))
+			}
+			time.Sleep(r.Delay + randomDelay)
 			<-r.waitChan
 		}(r)
 	}
@@ -118,10 +171,10 @@ func (h *httpBackend) Do(request *http.Request, bodySize int) (*Response, error)
 		bodyReader = io.LimitReader(bodyReader, int64(bodySize))
 	}
 	body, err := ioutil.ReadAll(bodyReader)
+	defer res.Body.Close()
 	if err != nil {
 		return nil, err
 	}
-	res.Body.Close()
 	return &Response{
 		StatusCode: res.StatusCode,
 		Body:       body,
